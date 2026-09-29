@@ -577,4 +577,226 @@ def exploit_loop():
                         connection_broken = True
                         send_ok = False
                         break
-                    request_count +
+                    request_count += 1
+                    msg_id += 1
+
+                if not send_ok or connection_broken:
+                    break
+
+                with state_lock:
+                    bot_state['route_stats']['Pkg 5']['sent'] += dynamic_rate
+                    bot_state['claims_done'] += dynamic_rate
+
+                # ---- Receive window ----
+                ws.settimeout(RECV_TIMEOUT)
+                recv_end = time.time() + RECV_WINDOW
+                while time.time() < recv_end:
+                    try:
+                        m = ws.recv()
+                        if not m:
+                            continue
+                        d = msgpack.unpackb(m, raw=False)
+                        route = d.get("route", "")
+                        inner = d.get("data", {})
+                        if route == "reloadCash":
+                            change = inner.get("changeCash", 0)
+                            if change > 0:
+                                with state_lock:
+                                    bot_state['total_claimed'] += change
+                                    bot_state['current_balance'] = inner.get("newCash", bot_state['current_balance'])
+                                    coins_in_interval += change
+                                    last_coin_time = time.time()
+                                    bot_state['route_stats']['Pkg 5']['received'] += 1
+                                    bot_state['route_stats']['Pkg 5']['coins'] += change
+                    except websocket.WebSocketTimeoutException:
+                        break
+                    except ssl.SSLError as e:
+                        logger.error(f"SSL error: {e}")
+                        connection_broken = True
+                        break
+                    except Exception as e:
+                        logger.error(f"Recv error: {e}")
+                        connection_broken = True
+                        break
+
+                if connection_broken:
+                    break
+
+                # ---- CPS every 1s ----
+                if time.time() - interval_start >= 1.0:
+                    cps = coins_in_interval / (time.time() - interval_start)
+                    with state_lock:
+                        bot_state['coins_per_second'] = cps
+                        bot_state['current_requests_per_second'] = request_count / (time.time() - interval_start)
+                    coins_in_interval = 0
+                    interval_start = time.time()
+                    request_count = 0
+
+                # ---- Coins stopped 60s ----
+                if time.time() - last_coin_time > 60:
+                    logger.warning("⚠️ Coins stopped 60s! Reconnecting...")
+                    bot_state['auto_restart_count'] += 1
+                    connection_broken = True
+                    break
+
+                time.sleep(SLEEP_BETWEEN_CYCLES)
+
+        except Exception as e:
+            logger.error(f"Exploit error: {e}")
+            bot_state['errors'] += 1
+            bot_state['last_error'] = str(e)
+            bot_state['auto_restart_count'] += 1
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+            bot_state['connected'] = False
+
+        if bot_state['is_running']:
+            logger.info(f"🔄 Auto restart #{bot_state['auto_restart_count']}...")
+            time.sleep(8)
+
+    bot_state['exploiting'] = False
+
+# ==================== AUTO MAIN LOOP ====================
+def auto_main_loop():
+    while True:
+        try:
+            logger.info("🔄 Verifying Pkg 5...")
+            success = verify_pkg5()
+            if success:
+                logger.info("✅ Pkg 5 confirmed. Cooling down 5s...")
+                time.sleep(5)
+                logger.info("⚡ Starting exploit with calibration...")
+                exploit_loop()
+            else:
+                logger.warning("❌ Pkg 5 not working, retry in 10s...")
+                time.sleep(10)
+        except Exception as e:
+            logger.error(f"Auto loop error: {e}")
+            time.sleep(5)
+
+# ==================== TELEGRAM HANDLERS ====================
+async def process_command(chat_id: str, text: str):
+    global owner_chat_id
+    text = text.strip()
+    if text.startswith('/start'):
+        if owner_chat_id is None:
+            owner_chat_id = chat_id
+        lc = bot_state.get('last_calibration', {}) or {}
+        status_text = (
+            "🤖 *FishMya Pkg 5 Adaptive Bot*\n\n"
+            f"🎯 Target: Pkg 5 ({TARGET_ROUTE['coins']:,}/claim)\n"
+            f"📊 Dynamic Rate: *{bot_state.get('dynamic_rate', 0)}* req\n"
+            f"🧪 Last Calib: {lc.get('accepted', 0)}/{lc.get('sent', 0)}\n"
+            f"💰 Balance: {bot_state.get('current_balance', 0):,}\n"
+            f"📈 Gained: +{bot_state.get('total_claimed', 0):,}\n"
+            f"📊 CPS: {int(bot_state.get('coins_per_second', 0)):,}\n"
+            f"🚀 RPS: {int(bot_state.get('current_requests_per_second', 0))}\n\n"
+            "Use buttons to control."
+        )
+        await send_telegram(chat_id, status_text, get_main_keyboard())
+    elif text in ['/stop']:
+        bot_state['is_running'] = False
+        await send_telegram(chat_id, "🛑 *Stopped by user.*")
+    elif text in ['/status']:
+        status = "🟢 Running" if bot_state['is_running'] else "🔴 Stopped"
+        elapsed = (datetime.now() - bot_state['start_time']).seconds if bot_state['start_time'] else 0
+        lc = bot_state.get('last_calibration', {}) or {}
+        text_msg = (
+            f"📊 *Status*\n\n"
+            f"State: {status}\n"
+            f"🎯 Target: Pkg 5\n"
+            f"📊 Rate: *{bot_state.get('dynamic_rate', 0)}* req\n"
+            f"🧪 Calib: {lc.get('accepted', 0)}/{lc.get('sent', 0)}\n"
+            f"Claims: {bot_state['claims_done']:,}\n"
+            f"💰 Balance: {bot_state['current_balance']:,}\n"
+            f"📈 Gained: +{bot_state['total_claimed']:,}\n"
+            f"📈 CPS: {int(bot_state.get('coins_per_second', 0)):,}\n"
+            f"🚀 RPS: {int(bot_state.get('current_requests_per_second', 0))}\n"
+            f"🔄 Restarts: {bot_state['auto_restart_count']}\n"
+            f"⏱️ Elapsed: {elapsed}s"
+        )
+        await send_telegram(chat_id, text_msg, get_main_keyboard())
+    elif text in ['/balance']:
+        await send_telegram(chat_id, f"💰 Balance: {bot_state['current_balance']:,}\n📈 Gained: +{bot_state['total_claimed']:,}")
+    elif text in ['/stats']:
+        lc = bot_state.get('last_calibration', {}) or {}
+        hist = bot_state.get('calibration_history', [])
+        stats_text = "📊 *Detailed Stats*\n\n"
+        stats_text += f"🎯 Target: Pkg 5 ({TARGET_ROUTE['coins']:,}/claim)\n"
+        stats_text += f"📊 Dynamic Rate: *{bot_state.get('dynamic_rate', 0)}* req\n"
+        stats_text += f"📈 Current CPS: {int(bot_state.get('coins_per_second', 0)):,}\n"
+        stats_text += f"🚀 RPS: {int(bot_state.get('current_requests_per_second', 0))}\n"
+        if lc:
+            stats_text += "\n🧪 *Last Calibration:*\n"
+            stats_text += f"  • Sent: {lc.get('sent', 0)}\n"
+            stats_text += f"  • ✅ Accepted: {lc.get('accepted', 0)}\n"
+            stats_text += f"  • ❌ Rejected: {lc.get('rejected', 0)}\n"
+            stats_text += f"  • ⏰ Timeouts: {lc.get('timeouts', 0)}\n"
+            stats_text += f"  • 💰 Coins: {lc.get('coins', 0):,}\n"
+        if hist:
+            stats_text += "\n📜 *Recent Calibrations:*\n"
+            for h in hist[-5:]:
+                stats_text += f"  • {h.get('time', '')}: {h.get('accepted', 0)}/{h.get('sent', 0)}\n"
+        stats_text += "\n📊 Route Stats:\n"
+        for desc, s in (bot_state.get('route_stats', {}) or {}).items():
+            stats_text += f"  • {desc}: {s.get('coins', 0):,} coins ({s.get('sent', 0)} sent / {s.get('received', 0)} recv)\n"
+        await send_telegram(chat_id, stats_text, get_main_keyboard())
+
+async def handle_callback(chat_id: str, data: str):
+    if data == "stop":
+        bot_state['is_running'] = False
+        await send_telegram(chat_id, "🛑 *Stopped.*")
+    elif data == "status":
+        await process_command(chat_id, "/status")
+    elif data == "balance":
+        await process_command(chat_id, "/balance")
+    elif data == "stats":
+        await process_command(chat_id, "/stats")
+
+# ==================== MAIN ====================
+async def main():
+    global last_update_id, owner_chat_id
+    print("Starting FishMya Pkg 5 Adaptive Bot...")
+    threading.Thread(target=auto_main_loop, daemon=True).start()
+    while True:
+        try:
+            updates = await get_updates(last_update_id + 1)
+            for update in updates:
+                if not isinstance(update, dict):
+                    continue
+                update_id = update.get('update_id', 0)
+                if update_id > last_update_id:
+                    last_update_id = update_id
+
+                cb = update.get('callback_query')
+                if isinstance(cb, dict):
+                    msg = cb.get('message') or {}
+                    chat = msg.get('chat') or {}
+                    chat_id = str(chat.get('id', ''))
+                    data = cb.get('data', '')
+                    if chat_id and data:
+                        await handle_callback(chat_id, data)
+                    continue
+
+                msg = update.get('message')
+                if isinstance(msg, dict):
+                    chat = msg.get('chat') or {}
+                    chat_id = str(chat.get('id', ''))
+                    text = msg.get('text', '')
+                    if chat_id and text:
+                        if owner_chat_id is None:
+                            owner_chat_id = chat_id
+                        await process_command(chat_id, text)
+            await asyncio.sleep(2)
+        except KeyboardInterrupt:
+            bot_state['is_running'] = False
+            break
+        except Exception as e:
+            logger.error(f"Main loop error: {e}")
+            await asyncio.sleep(5)
+
+if __name__ == "__main__":
+    asyncio.run(main())
